@@ -27,10 +27,6 @@ uv run gc-analyze analyze path/to/gc.log
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.11 or later
-
 ### Install uv
 
 ```bash

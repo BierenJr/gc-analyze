@@ -506,7 +506,8 @@ class G1GCParser:
     LEGACY_PAUSE_PATTERN: re.Pattern[str] = re.compile(
         r"(?P<timestamp>\d{4}-\d{2}-\d{2}T[\d:.+-]+):\s+"
         r"(?P<uptime>[\d.]+):\s+\[GC pause\s+\((?P<reason>[^)]+)\)\s+"
-        r"(?:\((?P<type>young|mixed|initial-mark)\))?,?\s+"
+        r"(?:\((?P<type1>young|mixed)\)\s*)?"
+        r"(?:\((?P<type2>initial-mark|remark)\)\s*)?,?\s+"
         r"(?P<pause>[\d.]+)\s+secs\]"
     )
 
@@ -514,6 +515,16 @@ class G1GCParser:
         r"Heap:\s+(?P<heap_before>[\d.]+)M\((?P<heap_total>[\d.]+)M\)"
         r"->(?P<heap_after>[\d.]+)M\([\d.]+M\)"
     )
+    
+    # Combined Eden/Survivors/Heap pattern (common in Java 8 G1 logs)
+    LEGACY_COMBINED_PATTERN: re.Pattern[str] = re.compile(
+        r"\[Eden:\s+(?P<eden_before>[\d.]+[BKMG])\((?P<eden_total>[\d.]+[BKMG])\)->"
+        r"(?P<eden_after>[\d.]+[BKMG])\((?P<eden_total_after>[\d.]+[BKMG])\)\s+"
+        r"Survivors:\s+(?P<survivor_before>[\d.]+[BKMG])->(?P<survivor_after>[\d.]+[BKMG])\s+"
+        r"Heap:\s+(?P<heap_before>[\d.]+[BKMG])\((?P<heap_total>[\d.]+[BKMG])\)->"
+        r"(?P<heap_after>[\d.]+[BKMG])\((?P<heap_total_after>[\d.]+[BKMG])\)\]"
+    )
+    
     LEGACY_EDEN_PATTERN: re.Pattern[str] = re.compile(
         r"Eden:\s+(?P<before>[\d.]+[BKMG])\((?P<total>[\d.]+[BKMG])\)->"
         r"(?P<after>[\d.]+[BKMG])\((?P<after_total>[\d.]+[BKMG])\)"
@@ -545,6 +556,31 @@ class G1GCParser:
             elif "GC pause" in line:
                 if match := self.LEGACY_PAUSE_PATTERN.search(line):
                     current_event = self._extract_legacy_pause(match)
+
+            # Check for combined Eden/Survivors/Heap line (common format)
+            if (
+                current_event
+                and "[Eden:" in line
+                and "Survivors:" in line
+                and "Heap:" in line
+                and (match := self.LEGACY_COMBINED_PATTERN.search(line))
+            ):
+                # Extract all values from the combined line
+                current_event["eden_before_kb"] = parse_size_to_kb(match.group("eden_before"))
+                current_event["eden_after_kb"] = parse_size_to_kb(match.group("eden_after"))
+                current_event["eden_total_kb"] = parse_size_to_kb(match.group("eden_total"))
+                
+                current_event["survivor_before_kb"] = parse_size_to_kb(match.group("survivor_before"))
+                current_event["survivor_after_kb"] = parse_size_to_kb(match.group("survivor_after"))
+                
+                current_event["heap_before"] = parse_size_to_kb(match.group("heap_before"))
+                current_event["heap_after"] = parse_size_to_kb(match.group("heap_after"))
+                current_event["heap_total"] = parse_size_to_kb(match.group("heap_total"))
+                
+                self._apply_legacy_young_old_estimates(current_event)
+                events.append(current_event)
+                current_event = None
+                continue
 
             # Check for heap info in legacy format (substring guard: "Heap:")
             elif (
@@ -674,11 +710,14 @@ class G1GCParser:
 
     def _extract_legacy_pause(self, match: re.Match[str]) -> dict[str, Any]:
         """Extract pause from legacy format."""
-        pause_type = match.group("type")
-
-        # Determine GC kind
-        if pause_type == "mixed":
+        type1 = match.group("type1")
+        type2 = match.group("type2")
+        
+        # Determine GC kind - type2 takes precedence for mixed/initial-mark
+        if type1 == "mixed" or (type2 and "initial-mark" not in type2):
             gc_kind: GCKind = "Mixed"
+        elif type2 == "initial-mark":
+            gc_kind = "Young"  # initial-mark is part of a young collection
         elif "Full GC" in match.group(0):
             gc_kind = "Full"
         else:

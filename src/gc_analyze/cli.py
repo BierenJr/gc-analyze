@@ -515,7 +515,7 @@ class G1GCParser:
         r"Heap:\s+(?P<heap_before>[\d.]+)M\((?P<heap_total>[\d.]+)M\)"
         r"->(?P<heap_after>[\d.]+)M\([\d.]+M\)"
     )
-    
+
     # Combined Eden/Survivors/Heap pattern (common in Java 8 G1 logs)
     LEGACY_COMBINED_PATTERN: re.Pattern[str] = re.compile(
         r"\[Eden:\s+(?P<eden_before>[\d.]+[BKMG])\((?P<eden_total>[\d.]+[BKMG])\)->"
@@ -524,7 +524,7 @@ class G1GCParser:
         r"Heap:\s+(?P<heap_before>[\d.]+[BKMG])\((?P<heap_total>[\d.]+[BKMG])\)->"
         r"(?P<heap_after>[\d.]+[BKMG])\((?P<heap_total_after>[\d.]+[BKMG])\)\]"
     )
-    
+
     LEGACY_EDEN_PATTERN: re.Pattern[str] = re.compile(
         r"Eden:\s+(?P<before>[\d.]+[BKMG])\((?P<total>[\d.]+[BKMG])\)->"
         r"(?P<after>[\d.]+[BKMG])\((?P<after_total>[\d.]+[BKMG])\)"
@@ -553,9 +553,8 @@ class G1GCParser:
                     events_by_id[event["gc_id"]] = event
 
             # Try legacy format (substring guard: "GC pause")
-            elif "GC pause" in line:
-                if match := self.LEGACY_PAUSE_PATTERN.search(line):
-                    current_event = self._extract_legacy_pause(match)
+            elif "GC pause" in line and (match := self.LEGACY_PAUSE_PATTERN.search(line)):
+                current_event = self._extract_legacy_pause(match)
 
             # Check for combined Eden/Survivors/Heap line (common format)
             if (
@@ -569,14 +568,16 @@ class G1GCParser:
                 current_event["eden_before_kb"] = parse_size_to_kb(match.group("eden_before"))
                 current_event["eden_after_kb"] = parse_size_to_kb(match.group("eden_after"))
                 current_event["eden_total_kb"] = parse_size_to_kb(match.group("eden_total"))
-                
-                current_event["survivor_before_kb"] = parse_size_to_kb(match.group("survivor_before"))
+
+                current_event["survivor_before_kb"] = parse_size_to_kb(
+                    match.group("survivor_before")
+                )
                 current_event["survivor_after_kb"] = parse_size_to_kb(match.group("survivor_after"))
-                
+
                 current_event["heap_before"] = parse_size_to_kb(match.group("heap_before"))
                 current_event["heap_after"] = parse_size_to_kb(match.group("heap_after"))
                 current_event["heap_total"] = parse_size_to_kb(match.group("heap_total"))
-                
+
                 self._apply_legacy_young_old_estimates(current_event)
                 events.append(current_event)
                 current_event = None
@@ -712,7 +713,7 @@ class G1GCParser:
         """Extract pause from legacy format."""
         type1 = match.group("type1")
         type2 = match.group("type2")
-        
+
         # Determine GC kind - type2 takes precedence for mixed/initial-mark
         if type1 == "mixed" or (type2 and "initial-mark" not in type2):
             gc_kind: GCKind = "Mixed"
@@ -1122,8 +1123,6 @@ def percentile_sorted(sorted_data: list[float], pct: float) -> float:
     if f + 1 < len(sorted_data):
         return sorted_data[f] + c * (sorted_data[f + 1] - sorted_data[f])
     return sorted_data[f]
-
-
 
 
 # ============================================================
@@ -2259,7 +2258,9 @@ def build_jvm_config_rows(config: JVMHeapConfig) -> list[tuple[str, str]]:
 
     # Heap Sizing
     if config.initial_heap_size_bytes:
-        rows.append(("Initial Heap Size (-Xms)", config.format_size(config.initial_heap_size_bytes)))
+        rows.append(
+            ("Initial Heap Size (-Xms)", config.format_size(config.initial_heap_size_bytes))
+        )
     if config.max_heap_size_bytes:
         rows.append(("Maximum Heap Size (-Xmx)", config.format_size(config.max_heap_size_bytes)))
     if config.new_size_bytes:
@@ -2333,9 +2334,7 @@ def build_jvm_config_rows(config: JVMHeapConfig) -> list[tuple[str, str]]:
     if config.g1_heap_region_size_bytes:
         rows.append(("G1 Heap Region Size", config.format_size(config.g1_heap_region_size_bytes)))
     if config.initiating_heap_occupancy_percent is not None:
-        rows.append(
-            ("Initiating Heap Occupancy %", f"{config.initiating_heap_occupancy_percent}%")
-        )
+        rows.append(("Initiating Heap Occupancy %", f"{config.initiating_heap_occupancy_percent}%"))
     if config.g1_reserve_percent is not None:
         rows.append(("G1 Reserve Percent", f"{config.g1_reserve_percent}%"))
     if config.g1_new_size_percent is not None:
@@ -2379,9 +2378,7 @@ def build_jvm_config_rows(config: JVMHeapConfig) -> list[tuple[str, str]]:
     if config.use_cms_initiating_occupancy_only is True:
         rows.append(("Use CMS Initiating Occupancy Only", "enabled"))
     if config.cms_full_gcs_before_compaction is not None:
-        rows.append(
-            ("CMS Full GCs Before Compaction", str(config.cms_full_gcs_before_compaction))
-        )
+        rows.append(("CMS Full GCs Before Compaction", str(config.cms_full_gcs_before_compaction)))
     if config.cms_wait_duration is not None:
         rows.append(("CMS Wait Duration", f"{config.cms_wait_duration}ms"))
 
@@ -2415,7 +2412,9 @@ def build_frequency_rows(summary: GCSummary) -> list[tuple[str, str]]:
         ("Full GCs per hour", f"{summary.full_gc_per_hour:.2f}"),
     ]
     if summary.avg_full_gc_interval_min:
-        rows.append(("Avg time between Full GCs", f"{summary.avg_full_gc_interval_min:.1f} minutes"))
+        rows.append(
+            ("Avg time between Full GCs", f"{summary.avg_full_gc_interval_min:.1f} minutes")
+        )
     return rows
 
 
@@ -2538,9 +2537,7 @@ def build_top_pauses_rows(events: list[GCEvent], top_n: int) -> list[dict[str, s
             f"{heap_after_mb:.0f}M/{heap_total_mb:.0f}M ({event.heap_used_percentage:.1f}%)"
         )
         old_text = (
-            f"{event.old_used_percentage:.1f}%"
-            if event.old_used_percentage is not None
-            else "—"
+            f"{event.old_used_percentage:.1f}%" if event.old_used_percentage is not None else "—"
         )
         rows.append(
             {
@@ -2648,6 +2645,7 @@ def determine_overall_status(summary: GCSummary) -> tuple[str, str]:
     if warning_count > 0:
         return "⚠ DEGRADED - MONITORING REQUIRED", "warning"
     return "✓ STABLE", "success"
+
 
 def render_rich_output(
     summary: GCSummary,
@@ -2976,11 +2974,11 @@ def export_markdown_summary(
     md_content.append("## Pause Time Analysis\n\n")
     md_content.append("| GC Type | Count | Avg | Median | P95 | P99 | Max |\n")
     md_content.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
-    for row in build_pause_distribution_rows(summary):
-        md_content.append(
-            f"| {row['type']} | {row['count']} | {row['avg']} | "
-            f"{row['median']} | {row['p95']} | {row['p99']} | {row['max']} |\n"
-        )
+    md_content.extend(
+        f"| {row['type']} | {row['count']} | {row['avg']} | "
+        f"{row['median']} | {row['p95']} | {row['p99']} | {row['max']} |\n"
+        for row in build_pause_distribution_rows(summary)
+    )
     md_content.append("\n")
 
     # Top pauses (fast triage)
@@ -2991,11 +2989,11 @@ def export_markdown_summary(
             md_content.append(f"## Top {min(top_n, len(top_rows))} Longest Pauses\n\n")
             md_content.append("| Timestamp | GC | Pause | Heap after | Old gen |\n")
             md_content.append("| --- | --- | ---: | ---: | ---: |\n")
-            for row in top_rows:
-                md_content.append(
-                    f"| {row['timestamp']} | {row['gc_kind']} | {row['pause']} | "
-                    f"{row['heap_after']} | {row['old_gen']} |\n"
-                )
+            md_content.extend(
+                f"| {row['timestamp']} | {row['gc_kind']} | {row['pause']} | "
+                f"{row['heap_after']} | {row['old_gen']} |\n"
+                for row in top_rows
+            )
             md_content.append("\n")
 
     # Collector-Specific Diagnostics
@@ -3295,13 +3293,13 @@ def analyze(
                 "\n[bold cyan]═══ Performance Profile (Top 20 Functions) ═══[/bold cyan]\n"
             )
             # Capture stats output
-            output = StringIO()
-            stats = pstats.Stats(profiler, stream=output)
+            stats_stream = StringIO()
+            stats = pstats.Stats(profiler, stream=stats_stream)
             stats.strip_dirs()
             stats.sort_stats("cumulative")
             stats.print_stats(20)
 
-            console.print(output.getvalue())
+            console.print(stats_stream.getvalue())
 
         # Exit with appropriate code
         if summary.leak_severity.severity_level in ["High", "Critical"]:

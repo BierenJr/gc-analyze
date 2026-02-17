@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gc-analyze"
+version = "3.0.0"
+description = "Advanced GC log analyzer with G1 and Parallel GC support"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+    "typer>=0.9.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+gc-analyze = "gc_analyze.cli:app"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "PERF", "PTH", "PL", "PIE", "RUF", "Q"]
+ignore = [
+    "PLR0911",  # Too many return statements (acceptable for guard clauses)
+    "PLR0912",  # Too many branches (acceptable for complex diagnostic logic)
+    "PLR0913",  # Too many arguments (render/export functions need diagnostic context)
+    "PLR0915",  # Too many statements (render function is necessarily large)
+    "PLR2004",  # Magic values (meaningful in GC analysis context: 90%, 60s, etc.)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.basedpyright]
+typeCheckingMode = "strict"
+reportUnknownParameterType = "error"
+reportUnknownMemberType = "error"
+reportUnknownVariableType = "error"
+reportMissingTypeArgument = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
+
+[dependency-groups]
+dev = [
+    "pip-audit>=2.10.0",
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.14.0",
+    "basedpyright>=1.37.0",
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "pip-audit>=2.7.0",
+]

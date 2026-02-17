@@ -220,6 +220,7 @@ class G1Metrics(BaseModel):
     evacuation_failure_count: int
     to_space_exhausted_count: int
 
+    concurrent_marking_cycles: int = 0
     g1_warnings: list[str] = Field(default_factory=list)
 
 
@@ -534,6 +535,18 @@ class G1GCParser:
         r"->(?P<after>[\d.]+[BKMG])(?:\((?P<after_total>[\d.]+[BKMG])\))?"
     )
 
+    LEGACY_REMARK_PATTERN: re.Pattern[str] = re.compile(
+        r"(?P<timestamp>\d{4}-\d{2}-\d{2}T[\d:.+-]+):\s+"
+        r"(?P<uptime>[\d.]+):\s+\[GC remark\s+.*?,\s+(?P<pause>[\d.]+)\s+secs\]"
+    )
+
+    LEGACY_CLEANUP_PATTERN: re.Pattern[str] = re.compile(
+        r"(?P<timestamp>\d{4}-\d{2}-\d{2}T[\d:.+-]+):\s+"
+        r"(?P<uptime>[\d.]+):\s+\[GC cleanup\s+"
+        r"(?P<heap_before>[\d.]+[BKMG])->(?P<heap_after>[\d.]+[BKMG])"
+        r"\((?P<heap_total>[\d.]+[BKMG])\),\s+(?P<pause>[\d.]+)\s+secs\]"
+    )
+
     LEGACY_TO_SPACE_EXHAUSTED: re.Pattern[str] = re.compile(r"to-space\s+(exhausted|overflow)")
 
     def parse(self, log_lines: list[str]) -> list[dict[str, Any]]:
@@ -544,8 +557,8 @@ class G1GCParser:
         region_size_kb: int | None = None
 
         for line in log_lines:
-            # Try unified logging first (substring guard: "Pause")
-            if "Pause" in line:
+            # Try unified logging first (substring guard: "Pause" + "[info]")
+            if "[info]" in line and "Pause" in line:
                 if match := self.UNIFIED_PAUSE_PATTERN.search(line):
                     event = self._extract_unified_pause(match, line)
                     events.append(event)
@@ -555,6 +568,37 @@ class G1GCParser:
             # Try legacy format (substring guard: "GC pause")
             elif "GC pause" in line and (match := self.LEGACY_PAUSE_PATTERN.search(line)):
                 current_event = self._extract_legacy_pause(match)
+
+            # Legacy remark events (single-line, no heap info)
+            elif "GC remark" in line and (match := self.LEGACY_REMARK_PATTERN.search(line)):
+                events.append(
+                    {
+                        "gc_kind": "Remark",
+                        "timestamp": match.group("timestamp"),
+                        "uptime": float(match.group("uptime")),
+                        "pause": float(match.group("pause")),
+                        "humongous_detected": False,
+                        "to_space_exhausted": False,
+                        "evacuation_failed": False,
+                    }
+                )
+
+            # Legacy cleanup events (single-line, has heap info)
+            elif "GC cleanup" in line and (match := self.LEGACY_CLEANUP_PATTERN.search(line)):
+                events.append(
+                    {
+                        "gc_kind": "Cleanup",
+                        "timestamp": match.group("timestamp"),
+                        "uptime": float(match.group("uptime")),
+                        "pause": float(match.group("pause")),
+                        "heap_before": parse_size_to_kb(match.group("heap_before")),
+                        "heap_after": parse_size_to_kb(match.group("heap_after")),
+                        "heap_total": parse_size_to_kb(match.group("heap_total")),
+                        "humongous_detected": False,
+                        "to_space_exhausted": False,
+                        "evacuation_failed": False,
+                    }
+                )
 
             # Check for combined Eden/Survivors/Heap line (common format)
             if (
@@ -1048,14 +1092,23 @@ def normalize_event(raw_event: dict[str, Any]) -> GCEvent | None:
 
     # Calculate heap percentage
     heap_total = raw_event.get("heap_total", 0)
+    heap_before = raw_event.get("heap_before", 0)
     heap_after = raw_event.get("heap_after", 0)
 
     if heap_total <= 0:
-        return None
-
-    # Calculate heap percentage with bounds checking
-    heap_used_pct = (heap_after / heap_total) * 100
-    heap_used_pct = max(0.0, min(100.0, heap_used_pct))  # Clamp to [0, 100]
+        if raw_event.get("gc_kind") in ("Remark", "Cleanup"):
+            # Remark/Cleanup events may lack heap data (JDK 8 legacy format)
+            # Preserve them for pause time statistics with zeroed heap fields
+            heap_total = 0
+            heap_before = 0
+            heap_after = 0
+            heap_used_pct = 0.0
+        else:
+            return None
+    else:
+        # Calculate heap percentage with bounds checking
+        heap_used_pct = (heap_after / heap_total) * 100
+        heap_used_pct = max(0.0, min(100.0, heap_used_pct))  # Clamp to [0, 100]
 
     # Calculate old gen percentage if available
     old_total = raw_event.get("old_total")
@@ -1075,7 +1128,7 @@ def normalize_event(raw_event: dict[str, Any]) -> GCEvent | None:
         uptime_seconds=raw_event.get("uptime", 0.0),
         gc_kind=raw_event["gc_kind"],
         pause_time_seconds=pause_time,
-        heap_before_kb=raw_event["heap_before"],
+        heap_before_kb=heap_before,
         heap_after_kb=heap_after,
         heap_total_kb=heap_total,
         heap_used_percentage=heap_used_pct,
@@ -1234,7 +1287,9 @@ def analyze_metaspace(events: list[GCEvent]) -> MetaspaceAnalysis | None:
     )
 
 
-def calculate_g1_metrics(events: list[GCEvent], runtime_hours: float) -> G1Metrics | None:
+def calculate_g1_metrics(
+    events: list[GCEvent], runtime_hours: float, concurrent_marking_cycles: int = 0
+) -> G1Metrics | None:
     """Calculate G1-specific metrics from events."""
     # Filter G1-related events
     mixed_gcs = [e for e in events if e.gc_kind == "Mixed"]
@@ -1242,8 +1297,16 @@ def calculate_g1_metrics(events: list[GCEvent], runtime_hours: float) -> G1Metri
     evacuation_failures = [e for e in events if e.evacuation_failed]
     to_space_exhausted = [e for e in events if e.to_space_exhausted]
 
-    # Only return metrics if we have G1-specific events
-    if not any([mixed_gcs, humongous_events, evacuation_failures, to_space_exhausted]):
+    # Only return metrics if we have G1-specific events or concurrent marking cycles
+    if not any(
+        [
+            mixed_gcs,
+            humongous_events,
+            evacuation_failures,
+            to_space_exhausted,
+            concurrent_marking_cycles > 0,
+        ]
+    ):
         return None
 
     warnings: list[str] = []
@@ -1270,6 +1333,7 @@ def calculate_g1_metrics(events: list[GCEvent], runtime_hours: float) -> G1Metri
         humongous_allocation_count=len(humongous_events),
         evacuation_failure_count=len(evacuation_failures),
         to_space_exhausted_count=len(to_space_exhausted),
+        concurrent_marking_cycles=concurrent_marking_cycles,
         g1_warnings=warnings,
     )
 
@@ -1507,7 +1571,10 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
 
 
 def build_comprehensive_summary(
-    events: list[GCEvent], thresholds: DiagnosticThresholds, log_lines: list[str]
+    events: list[GCEvent],
+    thresholds: DiagnosticThresholds,
+    log_lines: list[str],
+    concurrent_marking_cycles: int = 0,
 ) -> GCSummary:
     """Build comprehensive GC summary with enhanced diagnostics."""
     pauses_young = [e.pause_time_seconds for e in events if e.gc_kind == "Young"]
@@ -1880,7 +1947,7 @@ def build_comprehensive_summary(
     summary.metaspace_analysis = analyze_metaspace(events)
 
     # Add G1 metrics if applicable
-    summary.g1_metrics = calculate_g1_metrics(events, runtime_hours)
+    summary.g1_metrics = calculate_g1_metrics(events, runtime_hours, concurrent_marking_cycles)
 
     # Add CMS metrics if applicable
     summary.cms_metrics = calculate_cms_metrics(events, runtime_hours)
@@ -1980,6 +2047,7 @@ def create_parsing_coverage_table(
     raw_event_count: int,
     usable_event_count: int,
     unparsed_full_gc_headers: int | None = None,
+    dropped_event_details: str | None = None,
 ) -> Table:
     """Create parsing coverage table to make data quality explicit."""
     return create_key_value_table(
@@ -1989,6 +2057,7 @@ def create_parsing_coverage_table(
             raw_event_count=raw_event_count,
             usable_event_count=usable_event_count,
             unparsed_full_gc_headers=unparsed_full_gc_headers,
+            dropped_event_details=dropped_event_details,
         ),
     )
 
@@ -2268,14 +2337,18 @@ def build_parsing_coverage_rows(
     raw_event_count: int,
     usable_event_count: int,
     unparsed_full_gc_headers: int | None = None,
+    dropped_event_details: str | None = None,
 ) -> list[tuple[str, str]]:
     """Build rows describing parsing coverage."""
+    dropped_count = max(0, raw_event_count - usable_event_count)
     rows = [
         ("Total log lines", str(total_log_lines)),
         ("Parsed events (raw)", str(raw_event_count)),
         ("Usable events", str(usable_event_count)),
-        ("Dropped events", str(max(0, raw_event_count - usable_event_count))),
+        ("Dropped events", str(dropped_count)),
     ]
+    if dropped_count > 0 and dropped_event_details:
+        rows.append(("Dropped event details", dropped_event_details))
     if raw_event_count > 0:
         usable_pct = usable_event_count / raw_event_count * 100.0
         rows.append(("Usable rate", f"{usable_pct:.1f}%"))
@@ -2770,13 +2843,15 @@ def build_g1_rows(summary: GCSummary) -> list[tuple[str, str]]:
     g1 = summary.g1_metrics
     if not g1:
         return []
-    return [
+    rows = [
         ("Mixed GC count", f"{g1.mixed_gc_count}"),
         ("Mixed GCs per hour", f"{g1.mixed_gc_frequency_per_hour:.2f}"),
+        ("Concurrent marking cycles", f"{g1.concurrent_marking_cycles}"),
         ("Humongous activity (events)", f"{g1.humongous_allocation_count}"),
         ("Evacuation failures", f"{g1.evacuation_failure_count}"),
         ("To-space exhaustion events", f"{g1.to_space_exhausted_count}"),
     ]
+    return rows
 
 
 def build_cms_rows(summary: GCSummary) -> list[tuple[str, str]]:
@@ -2880,6 +2955,7 @@ def render_rich_output(
     total_log_lines: int | None = None,
     raw_event_count: int | None = None,
     unparsed_full_gc_headers: int | None = None,
+    dropped_event_details: str | None = None,
 ) -> None:
     """Render comprehensive analysis using Rich components."""
     # Header
@@ -2900,6 +2976,7 @@ def render_rich_output(
                 raw_event_count=raw_event_count,
                 usable_event_count=summary.total_event_count,
                 unparsed_full_gc_headers=unparsed_full_gc_headers,
+                dropped_event_details=dropped_event_details,
             )
         )
         console.print()
@@ -3120,6 +3197,7 @@ def export_markdown_summary(
     total_log_lines: int | None = None,
     raw_event_count: int | None = None,
     unparsed_full_gc_headers: int | None = None,
+    dropped_event_details: str | None = None,
 ) -> None:
     """Export analysis summary to Markdown format."""
     md_content: list[str] = []
@@ -3140,6 +3218,7 @@ def export_markdown_summary(
             raw_event_count=raw_event_count,
             usable_event_count=summary.total_event_count,
             unparsed_full_gc_headers=unparsed_full_gc_headers,
+            dropped_event_details=dropped_event_details,
         ):
             md_content.append(f"- **{label}:** {value}\n")
         md_content.append("\n")
@@ -3476,10 +3555,19 @@ def analyze(
 
         # Normalize events
         events: list[GCEvent] = []
+        dropped_reasons: dict[str, int] = {}
         for raw_event in raw_events:
             normalized_event = normalize_event(raw_event)
             if normalized_event is not None:
                 events.append(normalized_event)
+            else:
+                kind = raw_event.get("gc_kind", "Unknown")
+                dropped_reasons[kind] = dropped_reasons.get(kind, 0) + 1
+
+        dropped_event_details: str | None = None
+        if dropped_reasons:
+            parts = [f"{count} {kind}" for kind, count in sorted(dropped_reasons.items())]
+            dropped_event_details = ", ".join(parts) + " (no heap data)"
 
         if not events:
             console.print("[critical]ERROR: No usable GC events found in log file[/critical]")
@@ -3490,11 +3578,20 @@ def analyze(
         if verbose:
             console.print(f"[info]Successfully parsed {len(events)} GC events[/info]")
 
+        # Count G1 concurrent marking cycles (non-STW diagnostic signal)
+        concurrent_marking_cycles = 0
+        if parser.gc_type_name == "G1 GC":
+            for line in lines:
+                if "GC concurrent-mark-start" in line or (
+                    "Concurrent Cycle" in line and line.rstrip().endswith("Concurrent Cycle")
+                ):
+                    concurrent_marking_cycles += 1
+
         # Build summary with custom thresholds
         thresholds = DiagnosticThresholds(
             heap_warning_percentage=heap_warning, heap_critical_percentage=heap_critical
         )
-        summary = build_comprehensive_summary(events, thresholds, lines)
+        summary = build_comprehensive_summary(events, thresholds, lines, concurrent_marking_cycles)
 
         # Render output
         possible_full_gc_headers: int | None = None
@@ -3512,6 +3609,7 @@ def analyze(
             total_log_lines=len(lines),
             raw_event_count=len(raw_events),
             unparsed_full_gc_headers=unparsed_full_gc_headers,
+            dropped_event_details=dropped_event_details,
         )
 
         # Export if requested
@@ -3524,6 +3622,7 @@ def analyze(
                 total_log_lines=len(lines),
                 raw_event_count=len(raw_events),
                 unparsed_full_gc_headers=unparsed_full_gc_headers,
+                dropped_event_details=dropped_event_details,
             )
             console.print(f"\n[success]✓ Summary exported to {output}[/success]")
 
